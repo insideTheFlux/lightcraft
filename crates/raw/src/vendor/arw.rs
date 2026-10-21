@@ -672,13 +672,8 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
             (RawData::U16(data), 12)
         }
         32767 if chunks.len() == 1 && bits == 12 => {
-            // ARW version 1 (DSLR-A200 to A390): some files record a strip shorter than the coded data, so the
-            // stream is read up to the end of the file
-            let src = usize::try_from(chunks[0].offset)
-                .ok()
-                .filter(|&o| o < bytes.len())
-                .and_then(|o| bytes.get(o..))
-                .ok_or_else(|| RawError::Corrupt("raw strip outside file".into()))?;
+            // ARW version 1 (DSLR-A200 to A390): the recorded strip holds the whole coded frame on every sample
+            let src = chunk_bytes(bytes, &chunks[0]).ok_or_else(|| RawError::Corrupt("raw strip outside file".into()))?;
             match mode {
                 Mode::Header => (RawData::U16(Vec::new()), 12),
                 Mode::Full => (RawData::U16(super::arw1::decode(src, w, h)?), 12),
@@ -981,8 +976,9 @@ mod tests {
         let RawData::U16(ref data) = img.data else { panic!() };
         assert_eq!(data, &samples);
         assert_eq!((img.bits, img.black.values[0]), (12, 128.0));
-        // a strip cut short (the IFD that follows it is not valid coded data) never panics
-        let _ = decode(&packed_arw(w as u32, h as u32, strip[..strip.len() / 3].to_vec()), Mode::Full);
+        // a strip cut short is corrupt: the bytes after it (the IFD) are never read as coded data
+        let err = decode(&packed_arw(w as u32, h as u32, strip[..strip.len() / 3].to_vec()), Mode::Full).unwrap_err();
+        assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("ARW v1")), "{err:?}");
     }
 
     /// A 32767-compressed, 12-bit ARW of `w` x `h` whose single strip is `strip`.
