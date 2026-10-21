@@ -11,8 +11,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # every PR, including PRs stacked on another PR's branch
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
