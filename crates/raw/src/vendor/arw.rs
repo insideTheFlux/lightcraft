@@ -38,6 +38,9 @@
 //! bytes): plain 12-bit samples, two per three bytes, least-significant-bit first ([`unpack_row12`]); linear, black 128
 //! (512 on the 14-bit scale), CFA from the file's own pattern tag, crop centred on the frame (see [`default_crop`]).
 //!
+//! ARW version 1 (DSLR-A200 to A390; Compression 32767, BitsPerSample 12, any other strip size): Huffman-coded
+//! differences, column by column ([`super::arw1`]); black 128, white from the data.
+//!
 //! ARW6 (Compressed RAW 2, compression 32766): `arw6.rs`, output in 2 × 14-bit units.
 //!
 //! Also: uncompressed 16-bit ARW, and lossless-compressed ARW (Compression 7, ILCE-7M4 and later): LJ92 tiles whose
@@ -630,7 +633,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
     let strip_len: u64 = chunks.iter().map(|c| c.len).sum();
     // The row-per-w-bytes (ARW2) layout stores exactly one byte per pixel in a single strip; all 108 such files in the test
     // archive measure exactly width x height. A200/A230/A350 files carry a strip 4-23 % larger than that (and A290/A390 one
-    // smaller), which is a different packing, so they are refused rather than read with the wrong layout.
+    // smaller): those are ARW version 1, decoded by `arw1`.
     let one_byte_per_sample = chunks.len() == 1 && strip_len == (w * h) as u64;
     let packed12 = info.compression == 32767 && is_packed12(&info, chunks.len(), strip_len);
     let (data, out_bits) = match info.compression {
@@ -666,6 +669,19 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
                 }
             });
             (RawData::U16(data), 12)
+        }
+        32767 if chunks.len() == 1 && bits == 12 => {
+            // ARW version 1 (DSLR-A200 to A390): some files record a strip shorter than the coded data, so the
+            // stream is read up to the end of the file
+            let src = usize::try_from(chunks[0].offset)
+                .ok()
+                .filter(|&o| o < bytes.len())
+                .and_then(|o| bytes.get(o..))
+                .ok_or_else(|| RawError::Corrupt("raw strip outside file".into()))?;
+            match mode {
+                Mode::Header => (RawData::U16(Vec::new()), 12),
+                Mode::Full => (RawData::U16(super::arw1::decode(src, w, h)?), 12),
+            }
         }
         32767 => return Err(RawError::Unsupported("Sony ARW version 1 / packed compressed variant (raw strip is not one byte per pixel)".into())),
         7 if is_quad_tiled(bytes, &info) => match mode {
@@ -940,17 +956,32 @@ mod tests {
     }
 
     #[test]
-    fn strip_larger_or_smaller_than_one_byte_per_pixel_is_the_packed_variant() {
+    fn strip_larger_or_smaller_than_one_byte_per_pixel_is_arw_version_1() {
+        // zero bits are an invalid ARW v1 code: the full decode reports a corrupt strip, the probe accepts the layout
         for strip in [32 * 4 + 8, 32 * 4 * 5 / 4 - 1, 32 * 4 - 1] {
-            for mode in [Mode::Header, Mode::Full] {
-                let err = decode(&arw_with_strip(strip), mode).unwrap_err();
-                assert!(matches!(err, RawError::Unsupported(ref m) if m.contains("packed compressed variant")), "{strip} {mode:?}: {err:?}");
-            }
+            assert!(decode(&arw_with_strip(strip), Mode::Header).is_ok(), "{strip}");
+            let err = decode(&arw_with_strip(strip), Mode::Full).unwrap_err();
+            assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("ARW v1")), "{strip}: {err:?}");
         }
         for mode in [Mode::Header, Mode::Full] {
-            let r = decode(&arw_with_strip(32 * 4), mode);
-            assert!(!matches!(r, Err(RawError::Unsupported(ref m)) if m.contains("packed compressed variant")), "{r:?}");
+            assert!(decode(&arw_with_strip(32 * 4), mode).is_ok(), "{mode:?}");
         }
+    }
+
+    /// An ARW v1 strip (DSLR-A200 to A390) decodes to its 12-bit samples, black 128.
+    #[test]
+    fn arw_version_1_strip_decodes() {
+        let (w, h) = (32usize, 4usize);
+        let samples: Vec<u16> = (0..w * h).map(|i| 128 + (i * 37 % 3000) as u16).collect();
+        let strip = super::super::arw1::tests::encode(&samples, w, h);
+        let file = packed_arw(w as u32, h as u32, strip.clone());
+        // packed_arw names the A900; the layout, not the model, selects the decoder
+        let img = decode(&file, Mode::Full).unwrap();
+        let RawData::U16(ref data) = img.data else { panic!() };
+        assert_eq!(data, &samples);
+        assert_eq!((img.bits, img.black.values[0]), (12, 128.0));
+        // a strip cut short (the IFD that follows it is not valid coded data) never panics
+        let _ = decode(&packed_arw(w as u32, h as u32, strip[..strip.len() / 3].to_vec()), Mode::Full);
     }
 
     /// A 32767-compressed, 12-bit ARW of `w` x `h` whose single strip is `strip`.
@@ -1001,14 +1032,13 @@ mod tests {
         let (w, h) = (8usize, 4usize);
         let exact = w * h * 3 / 2;
         for strip in [exact - 1, exact + 1, exact + 3 * h] {
-            for mode in [Mode::Header, Mode::Full] {
-                let err = decode(&packed_arw(w as u32, h as u32, vec![0u8; strip]), mode).unwrap_err();
-                assert!(matches!(err, RawError::Unsupported(ref m) if m.contains("packed compressed variant")), "{strip} {mode:?}: {err:?}");
-            }
+            // not packed: read as ARW v1, whose all-zero bits are an invalid code
+            let err = decode(&packed_arw(w as u32, h as u32, vec![0u8; strip]), Mode::Full).unwrap_err();
+            assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("ARW v1")), "{strip}: {err:?}");
         }
         // an odd width cannot be packed in pairs
         let err = decode(&packed_arw(7, 4, vec![0u8; 7 * 4 * 3 / 2]), Mode::Full).unwrap_err();
-        assert!(matches!(err, RawError::Unsupported(_)), "{err:?}");
+        assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("ARW v1")), "{err:?}");
     }
 
     /// Encode one 16-value set as an ARW2 block (the paper's scheme, used here to test the decoder).
