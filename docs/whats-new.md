@@ -1,5 +1,17 @@
 # What's new in LightCraft
 
+## 2026-10-20
+
+### Windows: photos follow the monitor's colour profile
+- On Windows, photos are now shown through the colour profile Windows assigns to the monitor the window is on
+  (Settings ▸ System ▸ Display ▸ Color profile, Color Management, or a calibrator's profile), while no monitor profile
+  is chosen in Settings ▸ Display. Before, they were shown as sRGB, so a wide-gamut monitor showed them oversaturated
+  and a calibration was ignored unless you picked the profile by hand. Moving the window to another monitor, or
+  changing the profile in Windows, is followed within about a second.
+- While Windows manages colour itself (HDR on, or Auto Color Management on Windows 11), photos stay sRGB: Windows
+  converts them for the monitor then. Settings ▸ Display ▸ **Use Screen Profile** goes back to this after choosing a
+  profile by hand. See [display profiles](display-profiles.md).
+
 ## 2026-10-14
 
 ### Model downloads time out on a name that doesn't resolve
