@@ -1,5 +1,13 @@
 # What's new in LightCraft
 
+## 2026-10-22
+
+### Export subfolders stay inside the export folder
+- An export subfolder (typed in the Export dialog, saved in a preset or passed to `export`) can no longer lead
+  outside the chosen folder (issue #2571). `..` and `.` parts and a leading `/` are dropped, and `\` and `:` become
+  `_`, so a shared preset with `../..` in its subfolder writes inside your folder instead of elsewhere on disk.
+  Nested subfolders such as `Client/Jobs` still work.
+
 ## 2026-10-21
 
 ### Sharper resampling in HDR and panorama merges
