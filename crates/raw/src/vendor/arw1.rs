@@ -84,15 +84,23 @@ impl Bits<'_> {
     }
 }
 
+/// Whether a `strip_len`-byte strip can hold a coded `w` × `h` frame: every coded sample, [`EXTRA_ROWS`] included, takes
+/// at least [`MIN_BITS`]. Cheap, so the header decode checks it too (a file of another layout fails at import, not at
+/// its first render).
+pub(crate) fn check_strip(strip_len: u64, w: usize, h: usize) -> Result<()> {
+    let coded = (w as u64).saturating_mul((h as u64).saturating_add(EXTRA_ROWS as u64));
+    if strip_len.saturating_mul(8) < coded.saturating_mul(MIN_BITS) {
+        return Err(RawError::Corrupt("Sony ARW v1: raw strip too short for the frame".into()));
+    }
+    Ok(())
+}
+
 /// Decode a `w` × `h` frame (the image IFD's size; [`EXTRA_ROWS`] more are coded and dropped) into 12-bit samples.
 pub(crate) fn decode(src: &[u8], w: usize, h: usize) -> Result<Vec<u16>> {
     let coded_h = h.checked_add(EXTRA_ROWS).ok_or(RawError::Limit("image too large"))?;
     let len = w.checked_mul(h).ok_or(RawError::Limit("image too large"))?;
-    // every coded sample takes at least MIN_BITS: a strip too short for the frame is refused before the buffer exists
-    let coded = (w as u64).saturating_mul(coded_h as u64);
-    if (src.len() as u64).saturating_mul(8) < coded.saturating_mul(MIN_BITS) {
-        return Err(RawError::Corrupt("Sony ARW v1: raw strip too short for the frame".into()));
-    }
+    // refused before the buffer exists
+    check_strip(src.len() as u64, w, h)?;
     let mut out = vec![0u16; len];
     let lut = table();
     let mut bits = Bits { src, pos: 0, acc: 0, n: 0 };
