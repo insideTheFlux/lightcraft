@@ -8,8 +8,8 @@
 //! height; the extra rows are dropped.
 //!
 //! The code is canonical over 15 bits; [`CODES`] lists (code length, difference bits) in code order, the first entry
-//! taking the all-zero code. Verified on the CC0 raw.pixls.us samples of the DSLR-A200, A230, A290, A350, A380 and
-//! A390: each decodes to the scene of its embedded preview, every sum stays within 12 bits and the stream ends inside
+//! taking the all-zero code. Verified on the CC0 raw.pixls.us samples of the DSLR-A200, A230, A290, A300, A330, A350,
+//! A380 and A390: each decodes to the scene of its embedded preview, every sum stays within 12 bits and the stream ends inside
 //! the strip.
 
 use crate::{RawError, Result};
