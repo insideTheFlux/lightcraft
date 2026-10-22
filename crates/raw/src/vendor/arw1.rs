@@ -41,6 +41,9 @@ const CODES: [(u8, u8); 18] = [
 
 const PEEK: u32 = 15;
 
+/// The fewest bits one coded sample can take: the shortest codes plus their difference bits ((2, 1) and (3, 0)).
+const MIN_BITS: u64 = 3;
+
 /// 15-bit lookup: (code length, difference bits) for every possible next 15 bits.
 fn table() -> Vec<(u8, u8)> {
     let mut t = Vec::with_capacity(1 << PEEK);
@@ -85,6 +88,11 @@ impl Bits<'_> {
 pub(crate) fn decode(src: &[u8], w: usize, h: usize) -> Result<Vec<u16>> {
     let coded_h = h.checked_add(EXTRA_ROWS).ok_or(RawError::Limit("image too large"))?;
     let len = w.checked_mul(h).ok_or(RawError::Limit("image too large"))?;
+    // every coded sample takes at least MIN_BITS: a strip too short for the frame is refused before the buffer exists
+    let coded = (w as u64).saturating_mul(coded_h as u64);
+    if (src.len() as u64).saturating_mul(8) < coded.saturating_mul(MIN_BITS) {
+        return Err(RawError::Corrupt("Sony ARW v1: raw strip too short for the frame".into()));
+    }
     let mut out = vec![0u16; len];
     let lut = table();
     let mut bits = Bits { src, pos: 0, acc: 0, n: 0 };

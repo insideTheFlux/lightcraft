@@ -39,7 +39,7 @@
 //! (512 on the 14-bit scale), CFA from the file's own pattern tag, crop centred on the frame (see [`default_crop`]).
 //!
 //! ARW version 1 (DSLR-A200 to A390; Compression 32767, BitsPerSample 12, any other strip size): Huffman-coded
-//! differences, column by column ([`super::arw1`]); black 128, white from the data.
+//! differences, column by column ([`super::arw1`]); black from the `SR2SubIFD` (0 or 4 on the samples, see [`sr2_black_arw1`]), white from the data.
 //!
 //! ARW6 (Compressed RAW 2, compression 32766): `arw6.rs`, output in 2 × 14-bit units.
 //!
@@ -498,6 +498,16 @@ fn sr2_black(sr2: &super::sr2::SubIfd) -> Option<f32> {
     }
 }
 
+/// The black level of an ARW version 1 file (DSLR-A200 to A390), in 12-bit units: the `SR2SubIFD`'s `0x7310`, when its
+/// four levels agree within 16 and lie at or below 256. On the CC0 raw.pixls.us samples it is 0 on the A230, A290, A300,
+/// A330, A350, A380 and A390 and 4 on the A200, matching the data, whose darkest samples sit at 0–30 with exact zeros on
+/// dark scenes: the camera subtracts its black before coding. Without the tag the black is 0.
+fn sr2_black_arw1(sr2: &super::sr2::SubIfd) -> Option<f32> {
+    let v = sr2.shorts(BLACK_LEVEL).filter(|v| v.len() == 4)?;
+    let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    (lo >= 0.0 && hi <= 256.0 && hi - lo <= 16.0).then(|| (v.iter().sum::<f64>() / 4.0) as f32)
+}
+
 /// The DSC-R1's as-shot gains `[R/G, 1, B/G]` from `0x7303` (G, R, B, G), when plausible.
 fn sr2_old_wb(sr2: &super::sr2::SubIfd) -> Option<[f32; 3]> {
     let v = sr2.shorts(SR2_OLD_WB).filter(|v| v.len() == 4 && v.iter().all(|&x| x > 0.0))?;
@@ -721,6 +731,7 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         _ => Cfa::bayer_static("RGGB"),
     };
     let default_black = if scale_bits >= 14 { 512.0 } else { 128.0 };
+    let arw1 = info.compression == 32767 && !one_byte_per_sample && !packed12 && chunks.len() == 1 && bits == 12;
     // the decrypted SR2SubIFD, read once and only when a plain black level or white balance is missing
     let sr2_cell = std::cell::OnceCell::new();
     let sr2 = || sr2_cell.get_or_init(|| super::sr2::SubIfd::read(bytes, ifd0, tiff.order)).as_ref();
@@ -730,6 +741,8 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
             BlackLevel { repeat_rows: 2, repeat_cols: 2, values: vec![*a as f32, *b as f32, *c as f32, *d as f32], ..Default::default() }
         }
         _ if linear_rgb => BlackLevel::uniform(default_black + YCBCR_OFFSET),
+        // ARW version 1: the camera subtracted its black before coding (see `sr2_black_arw1`)
+        _ if arw1 => BlackLevel::uniform(sr2().and_then(sr2_black_arw1).unwrap_or(0.0)),
         _ => BlackLevel::uniform((scale_bits >= 14).then(|| sr2().and_then(sr2_black)).flatten().unwrap_or(default_black)),
     };
     // ARW6 samples are in 2 x 14-bit units, so the file's 14-bit levels double; without the tag the white is the
@@ -964,7 +977,9 @@ mod tests {
         }
     }
 
-    /// An ARW v1 strip (DSLR-A200 to A390) decodes to its 12-bit samples, black 128.
+    /// An ARW v1 strip (DSLR-A200 to A390) decodes to its 12-bit samples. Without an `SR2SubIFD` black level the black
+    /// is 0 (the camera subtracts its own before coding), not the packed-12 A900's 128 (#2495 review), and the header
+    /// decode reports the same size, bits, CFA and black as the full one.
     #[test]
     fn arw_version_1_strip_decodes() {
         let (w, h) = (32usize, 4usize);
@@ -975,7 +990,12 @@ mod tests {
         let img = decode(&file, Mode::Full).unwrap();
         let RawData::U16(ref data) = img.data else { panic!() };
         assert_eq!(data, &samples);
-        assert_eq!((img.bits, img.black.values[0]), (12, 128.0));
+        assert_eq!((img.bits, img.black.values.as_slice()), (12, &[0.0][..]));
+        let header = decode(&file, Mode::Header).unwrap();
+        assert_eq!(
+            (header.width, header.height, header.bits, header.cfa.clone(), header.black.values.clone()),
+            (img.width, img.height, img.bits, img.cfa.clone(), img.black.values.clone())
+        );
         // a strip cut short is corrupt: the bytes after it (the IFD) are never read as coded data
         let err = decode(&packed_arw(w as u32, h as u32, strip[..strip.len() / 3].to_vec()), Mode::Full).unwrap_err();
         assert!(matches!(err, RawError::Corrupt(ref m) if m.contains("ARW v1")), "{err:?}");
