@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-wincolor"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "lightcraft-testkit",
  "windows-sys 0.61.2",
