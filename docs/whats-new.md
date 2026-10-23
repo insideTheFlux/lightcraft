@@ -1,5 +1,13 @@
 # What's new in LightCraft
 
+## 2026-10-22
+
+### Place names always download into the settings folder
+- Download Place Names (for Fill Location from GPS) always saves the GeoNames files in the settings folder (issue
+  #2575). An agent or script driving LightCraft could name another folder and another server, and have that
+  server's files written there; it is now refused. Each file is saved complete or not at all, and replaces whatever
+  is in its place instead of writing through a link to somewhere else.
+
 ## 2026-10-21
 
 ### Sharper resampling in HDR and panorama merges
