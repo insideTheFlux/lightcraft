@@ -491,11 +491,7 @@ impl Renderer {
         if !self.request_needed(slot, job.key, priority) {
             return;
         }
-        let again = self.failed.get(&slot).is_some_and(|f| f.0 == job.key);
-        self.decided(|| {
-            let again = if again { " again after a failure" } else { "" };
-            format!("{}: requested{again}", render_subject(slot, job.photo, Some(&job.origin)))
-        });
+        self.note_request(slot, job.key, priority, "requested", || render_subject(slot, job.photo, Some(&job.origin)));
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
@@ -544,14 +540,14 @@ impl Renderer {
             return;
         }
         self.quick_tried.insert(slot, job.key);
-        self.pending.insert(slot, (job.key, priority));
-        job.request_id = lightcraft_preview::next_tick();
         let source = job
             .small
             .as_ref()
             .map(|job| job.origin.clone())
             .or_else(|| job.embedded.as_ref().map(|(path, _, _)| lightcraft_catalog::Source::File { path: path.clone() }));
-        self.decided(|| format!("{}: stand-in requested", render_subject(slot, job.photo, source.as_ref())));
+        self.note_request(slot, job.key, priority, "stand-in requested", || render_subject(slot, job.photo, source.as_ref()));
+        self.pending.insert(slot, (job.key, priority));
+        job.request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: job.request_id, source });
         let key = job.key;
         let display = self.display.clone();
@@ -569,7 +565,7 @@ impl Renderer {
         if !self.request_needed(slot, key, priority) {
             return;
         }
-        self.decided(|| format!("render {slot:?}: title screen requested"));
+        self.note_request(slot, key, priority, "title screen requested", || format!("render {slot:?}"));
         self.pending.insert(slot, (key, priority));
         let request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: request_id, source: None });
@@ -584,7 +580,7 @@ impl Renderer {
             return;
         }
         self.prefetched.insert(slot, job.key);
-        self.decided(|| format!("{}: prefetch requested", render_subject(slot, job.photo, Some(&job.origin))));
+        self.note_request(slot, job.key, priority, "prefetch requested", || render_subject(slot, job.photo, Some(&job.origin)));
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
@@ -604,10 +600,7 @@ impl Renderer {
             return;
         }
         let gone = |s: &Slot| matches!(s, Slot::Slide(id) if !keep.contains(id));
-        let dropped = self.pending.keys().filter(|s| gone(s)).count();
-        if dropped > 0 {
-            self.decided(|| format!("render: {dropped} slideshow slide request(s) abandoned, no longer near the slide shown"));
-        }
+        self.abandon_pending(gone, "no longer near the slide shown");
         self.textures.retain(|s, _| !gone(s));
         let _ = self.pool.reprioritize(|s, p| if gone(s) { None } else { Some(p) });
         self.queue.retain(|q| !gone(&q.slot));
@@ -621,12 +614,7 @@ impl Renderer {
     /// Is a request for `slot` queued or running?
     /// Drop every texture and cached stage (another library was opened: photo ids changed meaning).
     pub fn forget_all(&mut self) {
-        let dropped = self.pending.len();
-        if dropped > 0 {
-            self.decided(|| {
-                format!("render: {dropped} request(s) abandoned, the renderer started over (another library, or the previews were cleared)")
-            });
-        }
+        self.abandon_pending(|_| true, "the renderer started over (another library, or the previews were cleared)");
         self.requests.clear();
         self.shown_ids.clear();
         self.epoch = lightcraft_preview::next_tick();
@@ -903,9 +891,16 @@ impl Renderer {
             let rendered = match r.rendered {
                 Ok(x) => {
                     self.failed.remove(&slot);
+                    // (a stand-in that comes back after the thumbnail itself is thrown away below)
+                    let unused = matches!(slot, Slot::ThumbQuick(id) if self.textures.contains_key(&Slot::Thumb(id)));
                     self.decided(|| {
                         let source = source.as_ref().or_else(|| session.catalog.photo(r.photo).map(|p| &p.source));
-                        format!("{}: produced in {ms:.0} ms", render_subject(slot, r.photo, source))
+                        let subject = render_subject(slot, r.photo, source);
+                        if unused {
+                            format!("{subject}: abandoned, the thumbnail itself came first")
+                        } else {
+                            format!("{subject}: produced in {ms:.0} ms")
+                        }
                     });
                     x
                 }
@@ -1069,7 +1064,7 @@ impl Renderer {
             self.pending.remove(&s);
             let request = self.requests.remove(&s);
             self.quick_tried.remove(&s);
-            self.decided(|| thumb_abandoned(s, request.as_ref(), "scrolled out of view before it started"));
+            self.decided(|| abandoned_line(s, request.as_ref(), "scrolled out of view before it started"));
         }
         let mut gone = Vec::new();
         let requests = &mut self.requests;
@@ -1083,7 +1078,7 @@ impl Renderer {
             _ => true,
         });
         for (s, request) in gone {
-            self.decided(|| thumb_abandoned(s, request.as_ref(), "scrolled out of view before it started"));
+            self.decided(|| abandoned_line(s, request.as_ref(), "scrolled out of view before it started"));
         }
         let thumbs = self.thumb_textures();
         if thumbs <= max {
@@ -1099,7 +1094,7 @@ impl Renderer {
     /// built when the log takes debug lines (`LIGHTCRAFT_LOG=debug`, or
     /// `RUST_LOG=lightcraft_ui_egui::render=debug`), so the grid's requests cost nothing more otherwise.
     fn decided(&mut self, line: impl FnOnce() -> String) {
-        if !cfg!(test) && !log::log_enabled!(log::Level::Debug) {
+        if !logs_decisions() {
             return;
         }
         let line = line();
@@ -1107,6 +1102,47 @@ impl Renderer {
         #[cfg(test)]
         self.decisions.push(line);
     }
+
+    /// Log a new request for `slot`, and first what becomes of the one it replaces while that one
+    /// still waits: a queue holds one job per slot, so a newer render drops it, and the same render
+    /// is only moved to the new priority. One already running says so when its result comes back.
+    fn note_request(&mut self, slot: Slot, key: u64, priority: u32, what: &str, subject: impl FnOnce() -> String) {
+        if !logs_decisions() {
+            return;
+        }
+        let waiting = self.pending.get(&slot).map(|p| p.0).filter(|_| self.is_queued(slot));
+        if waiting == Some(key) {
+            let line = format!("{}: still waiting, moved to priority {priority}", subject());
+            self.decided(|| line);
+            return;
+        }
+        if waiting.is_some() {
+            let line = abandoned_line(slot, self.requests.get(&slot), "a newer request replaced it before it started");
+            self.decided(|| line);
+        }
+        let again = if self.failed.get(&slot).is_some_and(|f| f.0 == key) { " again after a failure" } else { "" };
+        let line = format!("{}: {what}{again}", subject());
+        self.decided(|| line);
+    }
+
+    /// Log each pending request in `which` as abandoned (`why`), before they are dropped.
+    fn abandon_pending(&mut self, which: impl Fn(&Slot) -> bool, why: &str) {
+        if !logs_decisions() {
+            return;
+        }
+        let mut slots: Vec<Slot> = self.pending.keys().copied().filter(|s| which(s)).collect();
+        slots.sort_by_key(|s| format!("{s:?}"));
+        for s in slots {
+            let line = abandoned_line(s, self.requests.get(&s), why);
+            self.decided(|| line);
+        }
+    }
+}
+
+/// Whether render decisions are logged ([`Renderer::decided`]): the log takes debug lines from this
+/// module, or a test is looking.
+fn logs_decisions() -> bool {
+    cfg!(test) || log::log_enabled!(log::Level::Debug)
 }
 
 /// How the log names a render: its slot, its photo and that photo's source, for every
@@ -1125,12 +1161,16 @@ fn render_failure_message(slot: Slot, photo: PhotoId, source: Option<&lightcraft
     format!("{}: {error}", render_subject(slot, photo, source))
 }
 
-/// The log line for a grid render dropped before it ran, named by the source it was requested from.
-fn thumb_abandoned(slot: Slot, request: Option<&Requested>, why: &str) -> String {
+/// The log line for a request dropped before its result came back, named by the source it was
+/// requested from. A grid slot names its photo; a view or slide slot shows whichever photo is open,
+/// so its file names it.
+fn abandoned_line(slot: Slot, request: Option<&Requested>, why: &str) -> String {
     let source = request.and_then(|r| r.source.as_ref());
-    match slot {
-        Slot::Thumb(id) | Slot::ThumbQuick(id) => format!("{}: abandoned, {why}", render_subject(slot, id, source)),
-        _ => format!("render {slot:?}: abandoned, {why}"),
+    match (slot, source) {
+        (Slot::Thumb(id) | Slot::ThumbQuick(id), _) => format!("{}: abandoned, {why}", render_subject(slot, id, source)),
+        (_, Some(lightcraft_catalog::Source::File { path })) => format!("render {slot:?}, file {path:?}: abandoned, {why}"),
+        (_, Some(lightcraft_catalog::Source::Demo { scene })) => format!("render {slot:?}, demo scene {scene}: abandoned, {why}"),
+        (_, None) => format!("render {slot:?}: abandoned, {why}"),
     }
 }
 
@@ -1184,13 +1224,27 @@ mod thumbnail_tests {
         let (_, a) = take_job(&work);
         finish(&mut app, &work, &ctx, slot, a.run());
         finish(&mut app, &work, &ctx, slot, b.run());
+        // a stand-in that comes back after the thumbnail itself is not used
+        let quick = Slot::ThumbQuick(PhotoId(1));
+        let mut j = job(&mut app, 64);
+        j.request_id = lightcraft_preview::next_tick();
+        app.renderer.requests.insert(quick, Requested { id: j.request_id, source: Some(j.origin.clone()) });
+        finish(&mut app, &work, &ctx, quick, j.run());
         assert_eq!(
             ends(&app.renderer.decisions),
-            ["requested", "produced in 0 ms", "requested", "requested", "abandoned, a newer request replaced it", "produced in 0 ms"]
+            [
+                "requested",
+                "produced in 0 ms",
+                "requested",
+                "requested",
+                "abandoned, a newer request replaced it",
+                "produced in 0 ms",
+                "abandoned, the thumbnail itself came first"
+            ]
         );
         let named = |app: &crate::LightcraftApp| {
             assert!(
-                app.renderer.decisions.iter().all(|l| l.starts_with("render Thumb(PhotoId(1)), PhotoId(1), file \"audit.jpg\": ")),
+                app.renderer.decisions.iter().all(|l| l.starts_with("render Thumb") && l.contains(", PhotoId(1), file \"audit.jpg\": ")),
                 "{:?}",
                 app.renderer.decisions
             );
@@ -1214,11 +1268,16 @@ mod thumbnail_tests {
         assert_eq!(ends(&app.renderer.decisions), ["requested", "requested again after a failure"]);
         named(&app);
 
-        // requests that end before they run: scrolled out of view, or everything forgotten
+        // requests that end before they run: the same render moved to another priority, a newer render
+        // in its place, scrolled out of view, everything forgotten
         let (mut app, _, _) = fixture();
         app.renderer.set_offload(Box::new(Blocked));
         let j = job(&mut app, 64);
         app.renderer.request(slot, j, 5);
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 10);
+        let j = job(&mut app, 128);
+        app.renderer.request(slot, j, 10);
         app.renderer.evict_thumbs(&Default::default(), 0);
         let j = job(&mut app, 64);
         app.renderer.request(slot, j, 5);
@@ -1227,12 +1286,21 @@ mod thumbnail_tests {
             ends(&app.renderer.decisions),
             [
                 "requested",
+                "still waiting, moved to priority 10",
+                "abandoned, a newer request replaced it before it started",
+                "requested",
                 "abandoned, scrolled out of view before it started",
                 "requested",
-                "1 request(s) abandoned, the renderer started over (another library, or the previews were cleared)"
+                "abandoned, the renderer started over (another library, or the previews were cleared)"
             ]
         );
-        assert!(app.renderer.decisions[1].contains("file \"audit.jpg\""), "{}", app.renderer.decisions[1]);
+        named(&app);
+        // a view shows whichever photo is open: its file names it
+        let main = Requested { id: 1, source: Some(Source::File { path: "trip/IMG_1.nef".into() }) };
+        assert_eq!(
+            abandoned_line(Slot::Main, Some(&main), "a newer request replaced it"),
+            "render Main, file \"trip/IMG_1.nef\": abandoned, a newer request replaced it"
+        );
     }
 
     struct Blocked;
