@@ -535,6 +535,11 @@ impl Renderer {
                 });
                 if queued && let Some(p) = self.pending.get_mut(&slot) {
                     p.1 = priority;
+                    if logs_decisions() {
+                        let source = self.requests.get(&slot).and_then(|r| r.source.as_ref());
+                        let line = format!("{}: still waiting, moved to priority {priority}", render_subject(slot, job.photo, source));
+                        self.decided(|| line);
+                    }
                 }
             }
             return;
@@ -1125,12 +1130,13 @@ impl Renderer {
         self.decided(|| line);
     }
 
-    /// Log each pending request in `which` as abandoned (`why`), before they are dropped.
+    /// Log each request in `which` that still waits in a queue as abandoned (`why`), before they are
+    /// dropped. One already running says so once, when its result comes back unclaimed.
     fn abandon_pending(&mut self, which: impl Fn(&Slot) -> bool, why: &str) {
         if !logs_decisions() {
             return;
         }
-        let mut slots: Vec<Slot> = self.pending.keys().copied().filter(|s| which(s)).collect();
+        let mut slots: Vec<Slot> = self.pending.keys().copied().filter(|s| which(s) && self.is_queued(*s)).collect();
         slots.sort_by_key(|s| format!("{s:?}"));
         for s in slots {
             let line = abandoned_line(s, self.requests.get(&s), why);
@@ -1230,6 +1236,12 @@ mod thumbnail_tests {
         j.request_id = lightcraft_preview::next_tick();
         app.renderer.requests.insert(quick, Requested { id: j.request_id, source: Some(j.origin.clone()) });
         finish(&mut app, &work, &ctx, quick, j.run());
+        // a render still running when everything is forgotten says so once, when it comes back
+        let j = job(&mut app, 200);
+        app.renderer.request(slot, j, 10);
+        let (_, j) = take_job(&work);
+        app.renderer.forget_all();
+        finish(&mut app, &work, &ctx, slot, j.run());
         assert_eq!(
             ends(&app.renderer.decisions),
             [
@@ -1239,7 +1251,9 @@ mod thumbnail_tests {
                 "requested",
                 "abandoned, a newer request replaced it",
                 "produced in 0 ms",
-                "abandoned, the thumbnail itself came first"
+                "abandoned, the thumbnail itself came first",
+                "requested",
+                "abandoned, no longer wanted when it finished"
             ]
         );
         let named = |app: &crate::LightcraftApp| {
@@ -1294,6 +1308,19 @@ mod thumbnail_tests {
                 "abandoned, the renderer started over (another library, or the previews were cleared)"
             ]
         );
+        named(&app);
+
+        // a stand-in still waiting that the grid moves up while it scrolls says so
+        let mut s = Session::new();
+        s.media.preview_loader = Some(Arc::new(|_, _| Some(lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[200, 100, 50, 255]; 16] })));
+        let mut raw = (*photo()).clone();
+        raw.kind = lightcraft_catalog::MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        let (mut app, _, _) = fixture_with(s, raw);
+        app.renderer.pool = JobPool::new(0); // nothing starts until run_inline
+        crate::panels::grid::request_thumb(&mut app, PhotoId(1), 384, 5);
+        crate::panels::grid::request_thumb(&mut app, PhotoId(1), 384, 10);
+        assert_eq!(ends(&app.renderer.decisions), ["stand-in requested", "still waiting, moved to priority 11"]);
         named(&app);
         // a view shows whichever photo is open: its file names it
         let main = Requested { id: 1, source: Some(Source::File { path: "trip/IMG_1.nef".into() }) };
