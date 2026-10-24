@@ -154,6 +154,7 @@ pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
                     as_shot_wb: None,
                     content_hash,
                     xmp: lightcraft_meta::embedded(bytes).xmp,
+                    orientation: m.orientation,
                     preview_only: Some(why),
                     ..Default::default()
                 });
@@ -181,6 +182,7 @@ pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
             as_shot_wb,
             content_hash,
             xmp: lightcraft_meta::embedded(bytes).xmp,
+            orientation: Some(raw.orientation),
             preview_only: None,
         });
     }
@@ -195,6 +197,17 @@ pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
     let (mut w, mut h) = (header.width, header.height);
     if o.swaps_axes() {
         std::mem::swap(&mut w, &mut h);
+    }
+    // regions another app drew on the photo as stored: `extract` turned them upright where the metadata says how
+    // big the photo is; otherwise the header does (#2674)
+    let mut meta = meta;
+    if (m.width.is_none() || m.height.is_none())
+        && o.swaps_axes()
+        && !meta.regions.is_empty()
+        && let Some(drawn_on) =
+            lightcraft_meta::embedded(bytes).xmp.and_then(|x| lightcraft_meta::parse_xmp(&x).ok()).and_then(|x| x.regions_drawn_on())
+    {
+        lightcraft_meta::upright_regions(&mut meta.regions, drawn_on, o, (header.width, header.height));
     }
     let format = match ext_upper(name).as_str() {
         "JPG" | "JPEG" => "JPEG".to_string(),
@@ -214,6 +227,7 @@ pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
         content_hash,
         embedded_lens: None,
         xmp: None,
+        orientation: m.orientation,
         preview_only: None,
     })
 }
