@@ -192,6 +192,9 @@ pub struct Renderer {
     requests: HashMap<Slot, Requested>,
     #[cfg(test)]
     failure_messages: Vec<String>,
+    /// The render decisions [`Self::decided`] logged.
+    #[cfg(test)]
+    decisions: Vec<String>,
     /// Request id of the pixels each interactive view (loupe, before, hover) shows: a draft that
     /// finishes after a newer request was made still replaces older pixels, so a long slider drag
     /// keeps updating the loupe instead of waiting for the drag to pause.
@@ -283,6 +286,8 @@ impl Renderer {
             requests: HashMap::new(),
             #[cfg(test)]
             failure_messages: Vec::new(),
+            #[cfg(test)]
+            decisions: Vec::new(),
             shown_ids: HashMap::new(),
             epoch: 0,
             preview_generation: None,
@@ -486,6 +491,11 @@ impl Renderer {
         if !self.request_needed(slot, job.key, priority) {
             return;
         }
+        let again = self.failed.get(&slot).is_some_and(|f| f.0 == job.key);
+        self.decided(|| {
+            let again = if again { " again after a failure" } else { "" };
+            format!("{}: requested{again}", render_subject(slot, job.photo, Some(&job.origin)))
+        });
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
@@ -541,6 +551,7 @@ impl Renderer {
             .as_ref()
             .map(|job| job.origin.clone())
             .or_else(|| job.embedded.as_ref().map(|(path, _, _)| lightcraft_catalog::Source::File { path: path.clone() }));
+        self.decided(|| format!("{}: stand-in requested", render_subject(slot, job.photo, source.as_ref())));
         self.requests.insert(slot, Requested { id: job.request_id, source });
         let key = job.key;
         let display = self.display.clone();
@@ -558,6 +569,7 @@ impl Renderer {
         if !self.request_needed(slot, key, priority) {
             return;
         }
+        self.decided(|| format!("render {slot:?}: title screen requested"));
         self.pending.insert(slot, (key, priority));
         let request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: request_id, source: None });
@@ -572,6 +584,7 @@ impl Renderer {
             return;
         }
         self.prefetched.insert(slot, job.key);
+        self.decided(|| format!("{}: prefetch requested", render_subject(slot, job.photo, Some(&job.origin))));
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
         self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
@@ -591,6 +604,10 @@ impl Renderer {
             return;
         }
         let gone = |s: &Slot| matches!(s, Slot::Slide(id) if !keep.contains(id));
+        let dropped = self.pending.keys().filter(|s| gone(s)).count();
+        if dropped > 0 {
+            self.decided(|| format!("render: {dropped} slideshow slide request(s) abandoned, no longer near the slide shown"));
+        }
         self.textures.retain(|s, _| !gone(s));
         let _ = self.pool.reprioritize(|s, p| if gone(s) { None } else { Some(p) });
         self.queue.retain(|q| !gone(&q.slot));
@@ -604,6 +621,12 @@ impl Renderer {
     /// Is a request for `slot` queued or running?
     /// Drop every texture and cached stage (another library was opened: photo ids changed meaning).
     pub fn forget_all(&mut self) {
+        let dropped = self.pending.len();
+        if dropped > 0 {
+            self.decided(|| {
+                format!("render: {dropped} request(s) abandoned, the renderer started over (another library, or the previews were cleared)")
+            });
+        }
         self.requests.clear();
         self.shown_ids.clear();
         self.epoch = lightcraft_preview::next_tick();
@@ -831,6 +854,10 @@ impl Renderer {
             self.completed += 1;
             // made for another display profile than the one in use: obsolete
             if r.display.is_some_and(|id| Some(id) != self.display_id()) {
+                self.decided(|| {
+                    let source = session.catalog.photo(r.photo).map(|p| &p.source);
+                    format!("{}: abandoned, made for another display profile", render_subject(slot, r.photo, source))
+                });
                 continue;
             }
             // Ignore obsolete pixels, failures and decoded sources, even for the same render key;
@@ -844,6 +871,12 @@ impl Renderer {
                     && self.shown_ids.get(&slot).is_none_or(|shown| r.request_id > *shown)
                     && r.rendered.is_ok();
                 if !newer_draft {
+                    let replaced = self.requests.contains_key(&slot);
+                    self.decided(|| {
+                        let why = if replaced { "a newer request replaced it" } else { "no longer wanted when it finished" };
+                        let source = session.catalog.photo(r.photo).map(|p| &p.source);
+                        format!("{}: abandoned, {why}", render_subject(slot, r.photo, source))
+                    });
                     continue;
                 }
                 session.accept(&r);
@@ -870,6 +903,10 @@ impl Renderer {
             let rendered = match r.rendered {
                 Ok(x) => {
                     self.failed.remove(&slot);
+                    self.decided(|| {
+                        let source = source.as_ref().or_else(|| session.catalog.photo(r.photo).map(|p| &p.source));
+                        format!("{}: produced in {ms:.0} ms", render_subject(slot, r.photo, source))
+                    });
                     x
                 }
                 Err(e) => {
@@ -879,6 +916,9 @@ impl Renderer {
                         self.failure_messages.push(message.clone());
                         log::warn!("{message}");
                         self.failed.insert(slot, (r.key, e, self.catalog_rev, r.photo));
+                    } else {
+                        // (a prefetch only prepares: its failure is no warning, but the trace says how it ended)
+                        self.decided(|| format!("{}: prefetch failed: {e}", render_subject(slot, r.photo, source.as_ref())));
                     }
                     continue;
                 }
@@ -1027,19 +1067,24 @@ impl Renderer {
         });
         for s in dropped {
             self.pending.remove(&s);
-            self.requests.remove(&s);
+            let request = self.requests.remove(&s);
             self.quick_tried.remove(&s);
+            self.decided(|| thumb_abandoned(s, request.as_ref(), "scrolled out of view before it started"));
         }
+        let mut gone = Vec::new();
         let requests = &mut self.requests;
         let pending = &mut self.pending;
         self.queue.retain(|q| match q.slot {
             Slot::Thumb(id) if !keep.contains(&id) && q.priority <= 10 => {
                 pending.remove(&q.slot);
-                requests.remove(&q.slot);
+                gone.push((q.slot, requests.remove(&q.slot)));
                 false
             }
             _ => true,
         });
+        for (s, request) in gone {
+            self.decided(|| thumb_abandoned(s, request.as_ref(), "scrolled out of view before it started"));
+        }
         let thumbs = self.thumb_textures();
         if thumbs <= max {
             return;
@@ -1047,15 +1092,45 @@ impl Renderer {
         self.textures.retain(|s, _| !matches!(s, Slot::Thumb(id) | Slot::ThumbQuick(id) if !keep.contains(id)));
         self.quick_tried.retain(|s, _| !matches!(s, Slot::ThumbQuick(id) if !keep.contains(id)));
     }
+
+    /// Log a render decision at debug level: each request, and how it ended when it ended without
+    /// a picture or a failure (failures stay warnings). One "requested" line per request tells a
+    /// file asked for 37 times from one asked once and failing inside (issue #2682). `line` is only
+    /// built when the log takes debug lines (`LIGHTCRAFT_LOG=debug`, or
+    /// `RUST_LOG=lightcraft_ui_egui::render=debug`), so the grid's requests cost nothing more otherwise.
+    fn decided(&mut self, line: impl FnOnce() -> String) {
+        if !cfg!(test) && !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let line = line();
+        log::debug!("{line}");
+        #[cfg(test)]
+        self.decisions.push(line);
+    }
 }
 
-/// Include the source identity in diagnostics for every catalog-backed render slot (#1890).
-/// Debug-format paths so whitespace/control characters cannot forge another log entry.
-fn render_failure_message(slot: Slot, photo: PhotoId, source: Option<&lightcraft_catalog::Source>, error: &str) -> String {
+/// How the log names a render: its slot, its photo and that photo's source, for every
+/// catalog-backed render slot (#1890). Debug-format paths so whitespace/control characters cannot
+/// forge another log entry.
+fn render_subject(slot: Slot, photo: PhotoId, source: Option<&lightcraft_catalog::Source>) -> String {
     match source {
-        Some(lightcraft_catalog::Source::File { path }) => format!("render {slot:?}, {photo:?}, file {path:?}: {error}"),
-        Some(lightcraft_catalog::Source::Demo { scene }) => format!("render {slot:?}, {photo:?}, demo scene {scene}: {error}"),
-        None => format!("render {slot:?}, {photo:?}, source unavailable: {error}"),
+        Some(lightcraft_catalog::Source::File { path }) => format!("render {slot:?}, {photo:?}, file {path:?}"),
+        Some(lightcraft_catalog::Source::Demo { scene }) => format!("render {slot:?}, {photo:?}, demo scene {scene}"),
+        None => format!("render {slot:?}, {photo:?}, source unavailable"),
+    }
+}
+
+/// Include the source identity in diagnostics ([`render_subject`]).
+fn render_failure_message(slot: Slot, photo: PhotoId, source: Option<&lightcraft_catalog::Source>, error: &str) -> String {
+    format!("{}: {error}", render_subject(slot, photo, source))
+}
+
+/// The log line for a grid render dropped before it ran, named by the source it was requested from.
+fn thumb_abandoned(slot: Slot, request: Option<&Requested>, why: &str) -> String {
+    let source = request.and_then(|r| r.source.as_ref());
+    match slot {
+        Slot::Thumb(id) | Slot::ThumbQuick(id) => format!("{}: abandoned, {why}", render_subject(slot, id, source)),
+        _ => format!("render {slot:?}: abandoned, {why}"),
     }
 }
 
@@ -1084,6 +1159,80 @@ mod thumbnail_tests {
         assert!(render_failure_message(Slot::Main, PhotoId(42), None, "decode failed").contains("PhotoId(42), source unavailable"));
         let demo = Source::Demo { scene: 7 };
         assert!(render_failure_message(Slot::Main, PhotoId(42), Some(&demo), "decode failed").contains("demo scene 7"));
+    }
+
+    /// Issue #2682: the log could not tell a file asked for 37 times from one asked once and failing
+    /// inside. At debug level every request is a line naming its file, and so is how it ended when it
+    /// drew nothing (a failure stays the warning it was).
+    #[test]
+    fn each_render_request_and_how_it_ended_is_a_debug_line_with_its_file() {
+        let ends =
+            |lines: &[String]| -> Vec<String> { lines.iter().map(|l| l.rsplit_once(": ").map_or(l.clone(), |(_, end)| end.to_string())).collect() };
+        let (mut app, work, ctx) = fixture();
+        let slot = Slot::Thumb(PhotoId(1));
+        let job = |app: &mut crate::LightcraftApp, edge| app.session.render_job(PhotoId(1), edge, edge, false, true).unwrap();
+        // asked once, drawn
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 10);
+        let (_, j) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, j.run());
+        // asked twice: the first answer comes after the second request and is dropped
+        let (a, b) = (job(&mut app, 128), job(&mut app, 160));
+        app.renderer.request(slot, a, 10);
+        app.renderer.request(slot, b, 10);
+        let (_, b) = take_job(&work);
+        let (_, a) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, a.run());
+        finish(&mut app, &work, &ctx, slot, b.run());
+        assert_eq!(
+            ends(&app.renderer.decisions),
+            ["requested", "produced in 0 ms", "requested", "requested", "abandoned, a newer request replaced it", "produced in 0 ms"]
+        );
+        let named = |app: &crate::LightcraftApp| {
+            assert!(
+                app.renderer.decisions.iter().all(|l| l.starts_with("render Thumb(PhotoId(1)), PhotoId(1), file \"audit.jpg\": ")),
+                "{:?}",
+                app.renderer.decisions
+            );
+        };
+        named(&app);
+
+        // a file that fails asks nothing while its failure stands, and says so when it is asked again
+        let (mut app, work, ctx) = fixture();
+        app.session.media.file_loader = Some(Arc::new(|_, _| Err("simulated decode failure".into())));
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 10);
+        let (_, j) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, j.run());
+        assert_eq!(app.renderer.failure_messages.len(), 1, "the failure is the warning it was");
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 10);
+        app.session.catalog.apply(Op::SetRating { id: PhotoId(1), rating: 3 }).unwrap();
+        app.renderer.poll(&ctx, &mut app.session);
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 10);
+        assert_eq!(ends(&app.renderer.decisions), ["requested", "requested again after a failure"]);
+        named(&app);
+
+        // requests that end before they run: scrolled out of view, or everything forgotten
+        let (mut app, _, _) = fixture();
+        app.renderer.set_offload(Box::new(Blocked));
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 5);
+        app.renderer.evict_thumbs(&Default::default(), 0);
+        let j = job(&mut app, 64);
+        app.renderer.request(slot, j, 5);
+        app.renderer.forget_all();
+        assert_eq!(
+            ends(&app.renderer.decisions),
+            [
+                "requested",
+                "abandoned, scrolled out of view before it started",
+                "requested",
+                "1 request(s) abandoned, the renderer started over (another library, or the previews were cleared)"
+            ]
+        );
+        assert!(app.renderer.decisions[1].contains("file \"audit.jpg\""), "{}", app.renderer.decisions[1]);
     }
 
     struct Blocked;
