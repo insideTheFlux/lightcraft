@@ -397,8 +397,9 @@ fn late_orientation(file: &mut (impl Read + Seek), head: &[u8]) -> Option<lightc
     }
 }
 
-/// A WebP's orientation from its `EXIF` chunk (at most [`ORIENTATION_SPAN`]), found by walking the chunk headers from
-/// the start of `file` (at most [`WEBP_CHUNK_STEPS`]).
+/// A WebP's orientation from its `EXIF` chunk, or else its `XMP ` chunk (which follows it), found by walking the chunk
+/// headers from the start of `file` (at most [`WEBP_CHUNK_STEPS`]). Only those chunks are read, each if it is at most
+/// [`ORIENTATION_SPAN`].
 fn webp_orientation(file: &mut (impl Read + Seek)) -> Option<lightcraft_meta::Orientation> {
     file.seek(SeekFrom::Start(12)).ok()?;
     for _ in 0..WEBP_CHUNK_STEPS {
@@ -406,17 +407,18 @@ fn webp_orientation(file: &mut (impl Read + Seek)) -> Option<lightcraft_meta::Or
         file.read_exact(&mut header).ok()?;
         let [a, b, c, d, s0, s1, s2, s3] = header;
         let size = u32::from_le_bytes([s0, s1, s2, s3]);
-        if [a, b, c, d] == *b"EXIF" {
-            if u64::from(size) > ORIENTATION_SPAN {
-                return None;
-            }
+        // chunks are padded to an even size
+        let mut skip = i64::from(size) + i64::from(size & 1);
+        if matches!(&[a, b, c, d], b"EXIF" | b"XMP ") && u64::from(size) <= ORIENTATION_SPAN {
             let mut chunk = b"RIFF\0\0\0\0WEBP".to_vec();
             chunk.extend_from_slice(&header);
             (&mut *file).take(u64::from(size)).read_to_end(&mut chunk).ok()?;
-            return lightcraft_meta::extract(&chunk).orientation;
+            if let Some(o) = lightcraft_meta::extract(&chunk).orientation {
+                return Some(o);
+            }
+            skip = i64::from(size & 1);
         }
-        // chunks are padded to an even size
-        file.seek(SeekFrom::Current(i64::from(size) + i64::from(size & 1))).ok()?;
+        file.seek(SeekFrom::Current(skip)).ok()?;
     }
     None
 }
@@ -428,16 +430,16 @@ const WEBP_CHUNK_STEPS: usize = 4096;
 /// 65535 of them, under 1 MiB). `le`: little-endian (`II`).
 fn tiff_orientation(file: &mut (impl Read + Seek), head: &[u8], le: bool) -> Option<lightcraft_meta::Orientation> {
     let u16_of = |b: [u8; 2]| if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) };
-    let [o0, o1, o2, o3] = <[u8; 4]>::try_from(head.get(4..8)?).ok()?;
-    let ifd = if le { u32::from_le_bytes([o0, o1, o2, o3]) } else { u32::from_be_bytes([o0, o1, o2, o3]) };
+    let u32_of = |b: [u8; 4]| if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) };
+    let ifd = u32_of(<[u8; 4]>::try_from(head.get(4..8)?).ok()?);
     file.seek(SeekFrom::Start(u64::from(ifd))).ok()?;
     let mut count = [0; 2];
     file.read_exact(&mut count).ok()?;
     let mut entries = vec![0; usize::from(u16_of(count)) * 12];
     file.read_exact(&mut entries).ok()?;
-    let orientation = entries.as_chunks::<12>().0.iter().find_map(|&[t0, t1, y0, y1, _, _, _, _, v0, v1, _, _]| {
-        // tag 274, one SHORT
-        (u16_of([t0, t1]) == 274 && u16_of([y0, y1]) == 3).then(|| u16_of([v0, v1]))
+    let orientation = entries.as_chunks::<12>().0.iter().find_map(|&[t0, t1, y0, y1, c0, c1, c2, c3, v0, v1, _, _]| {
+        // tag 274, exactly one SHORT (with more, the field also holds a second value, or an offset to them all)
+        (u16_of([t0, t1]) == 274 && u16_of([y0, y1]) == 3 && u32_of([c0, c1, c2, c3]) == 1).then(|| u16_of([v0, v1]))
     })?;
     (1..=8).contains(&orientation).then(|| lightcraft_meta::Orientation::from_exif(orientation))
 }
@@ -1050,8 +1052,9 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    /// Issue #2674: a WebP keeps its EXIF chunk after the image data, and a TIFF's first IFD can follow its strips, so
-    /// the orientation can be past the first [`super::ORIENTATION_SPAN`] of the file; a file that states none has none.
+    /// Issue #2674: a WebP keeps its EXIF and XMP chunks after the image data, and a TIFF's first IFD can follow its
+    /// strips, so the orientation can be past the first [`super::ORIENTATION_SPAN`] of the file; EXIF wins over XMP, a
+    /// chunk over that span isn't read, and a file that states none has none.
     #[test]
     fn the_file_orientation_is_found_after_the_image_data() {
         let dir = std::env::temp_dir().join(format!("lightcraft-file-orientation-{}", std::process::id()));
@@ -1061,28 +1064,38 @@ mod tests {
             orientation: Some(lightcraft_meta::Orientation::Rotate90),
             ..Default::default()
         });
-        let webp = |image: usize| {
+        let span = super::ORIENTATION_SPAN as usize;
+        // a WebP: `image` bytes of image data, then the `meta` chunks
+        let webp = |image: usize, meta: &[(&[u8], Vec<u8>)]| {
             let mut w = b"RIFF\0\0\0\0WEBP".to_vec();
-            for (id, data) in [(&b"VP8X"[..], vec![0; 10]), (b"VP8L", vec![0; image]), (b"EXIF", [&b"Exif\0\0"[..], &exif].concat())] {
+            for (id, data) in [(&b"VP8X"[..], vec![0; 10]), (b"VP8L", vec![0; image])].iter().chain(meta) {
                 w.extend_from_slice(id);
                 w.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                w.extend_from_slice(&data);
+                w.extend_from_slice(data);
                 if data.len() % 2 == 1 {
                     w.push(0);
                 }
             }
             w
         };
-        let span = super::ORIENTATION_SPAN as usize;
+        let exif_chunk = (&b"EXIF"[..], [&b"Exif\0\0"[..], &exif].concat());
+        // an EXIF chunk over the span that is read (orientation 6 too), and an XMP packet stating orientation 8
+        let huge_exif = (&b"EXIF"[..], [&b"Exif\0\0"[..], &exif, &vec![0; span]].concat());
+        let packet = lightcraft_meta::write_xmp(
+            &lightcraft_meta::Metadata { orientation: Some(lightcraft_meta::Orientation::Rotate270), ..Default::default() },
+            None,
+        );
+        let xmp_chunk = (&b"XMP "[..], packet.into_bytes());
         // a TIFF whose first IFD (orientation 8, then a tag pointing elsewhere) follows `strips` bytes of image data
-        let tiff = |le: bool, strips: usize| {
+        // (`values` of the orientation tag: more than two are at an offset, here 8)
+        let tiff = |le: bool, strips: usize, values: u32| {
             let (u16_of, u32_of): (fn(u16) -> [u8; 2], fn(u32) -> [u8; 4]) =
                 if le { (u16::to_le_bytes, u32::to_le_bytes) } else { (u16::to_be_bytes, u32::to_be_bytes) };
             let mut t = if le { b"II*\0".to_vec() } else { b"MM\0*".to_vec() };
             t.extend_from_slice(&u32_of(8 + strips as u32));
             t.resize(8 + strips, 0);
             t.extend_from_slice(&u16_of(2));
-            for (tag, kind, count, value) in [(274u16, 3u16, 1u32, [u16_of(8), [0, 0]].concat()), (305, 2, 64, u32_of(4).to_vec())] {
+            for (tag, kind, count, value) in [(274u16, 3u16, values, [u16_of(8), [0, 0]].concat()), (305, 2, 64, u32_of(4).to_vec())] {
                 t.extend_from_slice(&u16_of(tag));
                 t.extend_from_slice(&u16_of(kind));
                 t.extend_from_slice(&u32_of(count));
@@ -1099,11 +1112,14 @@ mod tests {
         }
         jpeg.extend_from_slice(&[0xff, 0xda, 0, 2, 0xff, 0xd9]);
         for (name, bytes, want) in [
-            ("small.webp", webp(64), Some(lightcraft_meta::Orientation::Rotate90)),
-            ("large.webp", webp(span + 64), Some(lightcraft_meta::Orientation::Rotate90)),
-            ("none.webp", webp(span + 64)[..span + 100].to_vec(), None),
-            ("le.tif", tiff(true, span + 64), Some(lightcraft_meta::Orientation::Rotate270)),
-            ("be.tif", tiff(false, span + 64), Some(lightcraft_meta::Orientation::Rotate270)),
+            ("small.webp", webp(64, std::slice::from_ref(&exif_chunk)), Some(lightcraft_meta::Orientation::Rotate90)),
+            ("large.webp", webp(span + 64, &[exif_chunk.clone(), xmp_chunk.clone()]), Some(lightcraft_meta::Orientation::Rotate90)),
+            ("none.webp", webp(span + 64, &[exif_chunk])[..span + 100].to_vec(), None),
+            ("xmp.webp", webp(span + 64, std::slice::from_ref(&xmp_chunk)), Some(lightcraft_meta::Orientation::Rotate270)),
+            ("huge.webp", webp(span + 64, &[huge_exif, xmp_chunk]), Some(lightcraft_meta::Orientation::Rotate270)),
+            ("le.tif", tiff(true, span + 64, 1), Some(lightcraft_meta::Orientation::Rotate270)),
+            ("be.tif", tiff(false, span + 64, 1), Some(lightcraft_meta::Orientation::Rotate270)),
+            ("offset.tif", tiff(true, span + 64, 3), None),
             ("none.jpg", jpeg, None),
         ] {
             let path = dir.join(name);
