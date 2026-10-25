@@ -495,6 +495,18 @@ fn write_turned_jpeg(path: &Path, packet: Option<&str>) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Put more than the first MiB of APP15 segments between the JPEG at `path`'s start and its Exif.
+fn pad_before_exif(path: &Path) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut padded = bytes[..2].to_vec();
+    for _ in 0..17 {
+        padded.extend_from_slice(&[0xFF, 0xEF, 0xFF, 0xFF]);
+        padded.extend(std::iter::repeat_n(0, 0xFFFD));
+    }
+    padded.extend_from_slice(&bytes[2..]);
+    std::fs::write(path, padded).unwrap();
+}
+
 /// The face's box from [`STORED_FRAME_REGIONS`] on the upright photo: turned a quarter turn clockwise with it.
 fn assert_on_the_upright_face(s: &Session, id: PhotoId, when: &str) {
     let p = s.catalog.photo(id).unwrap();
@@ -508,7 +520,8 @@ fn assert_on_the_upright_face(s: &Session, id: PhotoId, when: &str) {
 
 /// Issue #2674: face boxes an app drew on a photo as stored (its sideways size as `AppliedToDimensions`, no
 /// `mwg-rs:Rotation`) land on the faces of the photo as LightCraft shows it, upright: when imported, and when the
-/// file's metadata is read again (the packet itself doesn't say how the photo turns; the file's Exif does).
+/// file's metadata is read again (the packet itself doesn't say how the photo turns; the file's Exif does). The
+/// image's own size decides, not one the XMP states upright, and the Exif is found past the first MiB of the file.
 #[test]
 fn regions_drawn_on_the_photo_as_stored_land_on_the_upright_photo() {
     let src = temp_dir("regions-stored-frame");
@@ -517,7 +530,16 @@ fn regions_drawn_on_the_photo_as_stored_land_on_the_upright_photo() {
     let beside = src.join("sidecar.jpg");
     write_turned_jpeg(&beside, None);
     std::fs::write(src.join("sidecar.xmp"), STORED_FRAME_REGIONS).unwrap();
-    for (file, what) in [(&embedded, "embedded XMP"), (&beside, "sidecar")] {
+    // an Exif without a pixel size, and an XMP size of the upright photo
+    let stated = src.join("stated.jpg");
+    let upright_size = r#"rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:ImageWidth="24" tiff:ImageLength="32""#;
+    write_turned_jpeg(&stated, Some(&STORED_FRAME_REGIONS.replace(r#"rdf:about="""#, upright_size)));
+    let late = src.join("late.jpg");
+    write_turned_jpeg(&late, None);
+    pad_before_exif(&late);
+    std::fs::write(src.join("late.xmp"), STORED_FRAME_REGIONS).unwrap();
+    for (file, what) in [(&embedded, "embedded XMP"), (&beside, "sidecar"), (&stated, "upright size in the XMP"), (&late, "Exif after the first MiB")]
+    {
         let mut s = Session::new().with_fs();
         let r = s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
         assert_eq!(r["imported"].as_array().map(Vec::len), Some(1), "{r}");

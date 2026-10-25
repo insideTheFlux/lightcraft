@@ -122,8 +122,9 @@ write them, from sidecars and from XMP embedded in the file. Named faces become 
   taken as written. Other applications mark boxes drawn on the photo as stored only by their size: when
   `mwg-rs:AppliedToDimensions` has the shape of the photo as stored rather than upright (a photo that Exif orientation
   5–8 turns a quarter turn, and no `mwg-rs:Rotation`), the boxes are turned with the file's own Exif orientation,
-  mirror included, when imported and when read again (#2674). A square photo or size looks the same both ways and is
-  taken as written. Boxes follow LightCraft's own Rotate Left/Right and flips.
+  mirror included, when imported and when read again (#2674). The image's own pixel size decides, not a size the
+  metadata states, and the orientation is found wherever the file keeps its Exif (WebP after the image data, for
+  one). A square photo or size looks the same both ways and is taken as written. Boxes follow LightCraft's own Rotate Left/Right and flips.
 - **Re-reading**: a sidecar that has `mwg-rs:Regions` — even with an empty list — replaces the photo's regions, so
   regions removed in another application go away here too. A sidecar without `mwg-rs:Regions` (an application that
   doesn't do regions) leaves the photo's regions as they are.

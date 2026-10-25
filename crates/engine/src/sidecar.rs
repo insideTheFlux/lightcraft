@@ -359,20 +359,33 @@ impl SidecarData {
 
     /// Take the orientation of the photo file at `original` (LightCraft shows the photo turned by it, and the packet
     /// may not repeat it) when the regions need it: they were drawn on a stated size ([`SidecarData::regions_drawn_on`]).
-    /// Only then is the start of the file read.
+    /// Only then is the file read ([`file_orientation`]).
     pub fn with_file_orientation(self, original: &str) -> Self {
         if self.regions_drawn_on.is_none() {
             return self;
         }
-        let mut head = Vec::new();
-        let read = std::fs::File::open(original).and_then(|f| f.take(ORIENTATION_SPAN).read_to_end(&mut head));
-        let orientation = read.ok().and_then(|_| lightcraft_meta::extract(&head).orientation);
-        SidecarData { orientation: orientation.or(self.orientation), ..self }
+        SidecarData { orientation: file_orientation(original).or(self.orientation), ..self }
     }
 }
 
-/// How much of a photo file [`SidecarData::with_file_orientation`] reads: Exif sits at the start of every format
-/// LightCraft reads.
+/// The orientation the photo file at `path` states. Most files state it in their first [`ORIENTATION_SPAN`]; when
+/// that part doesn't, the rest is read too: WebP keeps its EXIF chunk after the image data, many TIFF writers put the
+/// first IFD after the strips, and a JPEG's Exif can follow other long segments.
+fn file_orientation(path: &str) -> Option<lightcraft_meta::Orientation> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    (&mut file).take(ORIENTATION_SPAN).read_to_end(&mut bytes).ok()?;
+    if let Some(o) = lightcraft_meta::extract(&bytes).orientation {
+        return Some(o);
+    }
+    if (bytes.len() as u64) < ORIENTATION_SPAN {
+        return None;
+    }
+    file.read_to_end(&mut bytes).ok()?;
+    lightcraft_meta::extract(&bytes).orientation
+}
+
+/// How much of a photo file [`file_orientation`] reads first.
 const ORIENTATION_SPAN: u64 = 1 << 20;
 
 /// The sidecar packet for a photo; the colour label is written by its name in `cat` (custom
@@ -975,6 +988,43 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #2674: a WebP keeps its EXIF chunk after the image data, so its orientation can be past the first
+    /// [`super::ORIENTATION_SPAN`] of the file; a file that states none has none.
+    #[test]
+    fn the_file_orientation_is_found_after_the_image_data() {
+        let dir = std::env::temp_dir().join(format!("lightcraft-file-orientation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exif = lightcraft_meta::write_exif(&lightcraft_meta::Metadata {
+            orientation: Some(lightcraft_meta::Orientation::Rotate90),
+            ..Default::default()
+        });
+        let webp = |image: usize| {
+            let mut w = b"RIFF\0\0\0\0WEBP".to_vec();
+            for (id, data) in [(&b"VP8X"[..], vec![0; 10]), (b"VP8L", vec![0; image]), (b"EXIF", [&b"Exif\0\0"[..], &exif].concat())] {
+                w.extend_from_slice(id);
+                w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                w.extend_from_slice(&data);
+                if data.len() % 2 == 1 {
+                    w.push(0);
+                }
+            }
+            w
+        };
+        let span = super::ORIENTATION_SPAN as usize;
+        for (name, bytes, want) in [
+            ("small.webp", webp(64), Some(lightcraft_meta::Orientation::Rotate90)),
+            ("large.webp", webp(span + 64), Some(lightcraft_meta::Orientation::Rotate90)),
+            ("none.webp", webp(span + 64)[..span + 100].to_vec(), None),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(super::file_orientation(&path.to_string_lossy()), want, "{name}");
+        }
+        assert_eq!(super::file_orientation(&dir.join("missing.webp").to_string_lossy()), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn sidecars_are_written_only_beside_an_existing_original() {
         let dir = std::env::temp_dir().join(format!("lightcraft-sidecar-local-{}", std::process::id()));
