@@ -116,6 +116,8 @@ mod tests_grid;
 #[cfg(test)]
 mod tests_guided_guides;
 #[cfg(test)]
+mod tests_histogram_drag;
+#[cfg(test)]
 mod tests_info_dialogs;
 #[cfg(test)]
 mod tests_keymap;
@@ -298,6 +300,10 @@ pub struct Services {
     pub pick_slideshow_templates: Option<PickFiles>,
     /// Save dialog for an exported slideshow template (`.json`).
     pub save_slideshow_template: Option<SaveFile>,
+    /// Open dialog for print template files (`.lcprint`; File ▸ Print… ▸ Templates ▸ Import…).
+    pub pick_print_templates: Option<PickFiles>,
+    /// Save dialog for an exported print template (`.lcprint`).
+    pub save_print_template: Option<SaveFile>,
     pub write: Option<WriteFn>,
     /// Thread-safe writer: with it, UI-started exports run in the background (desktop only).
     pub write_shared: Option<SharedWrite>,
