@@ -61,6 +61,19 @@ fn managed(flags: u32) -> bool {
     flags & 0b110 != 0
 }
 
+/// The answer Windows' own colour management settles, `None` when the monitor's profile decides:
+/// [`MonitorColor::ManagedByWindows`] while it colour-manages the desktop, and
+/// [`MonitorColor::Unknown`] when its state can't be read (`managed` is `None`), since applying the
+/// monitor's profile on top of Windows' conversion would convert twice.
+#[cfg(any(windows, test))]
+fn settled_by_windows(managed: Option<bool>) -> Option<MonitorColor> {
+    match managed {
+        Some(true) => Some(MonitorColor::ManagedByWindows),
+        Some(false) => None,
+        None => Some(MonitorColor::Unknown),
+    }
+}
+
 /// The text of a NUL-terminated UTF-16 buffer (all of it without a NUL).
 #[cfg(any(windows, test))]
 fn until_nul(units: &[u16]) -> &[u16] {
@@ -70,7 +83,7 @@ fn until_nul(units: &[u16]) -> &[u16] {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod win32 {
-    use super::{MonitorColor, managed, until_nul};
+    use super::{MonitorColor, managed, settled_by_windows, until_nul};
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
@@ -100,11 +113,11 @@ mod win32 {
 
     pub fn monitor_color(hwnd: isize) -> MonitorColor {
         let Some(device) = monitor_device(hwnd) else { return MonitorColor::Unknown };
-        if managed_by_windows(&device) == Some(true) {
-            return MonitorColor::ManagedByWindows;
+        // (an advanced-colour state that can't be read, as on Windows before 10 1709 or with a
+        // driver that doesn't say, is unknown: previews then stay sRGB, as before profiles were read)
+        if let Some(answer) = settled_by_windows(managed_by_windows(&device)) {
+            return answer;
         }
-        // (an unknown advanced-colour state, as on Windows before 10 1709 or with a driver that
-        // doesn't say, counts as not managed)
         match monitor_id(&device) {
             Some(id) => wcs_profile(&id),
             None => icm_profile(&device).map_or(MonitorColor::Unknown, MonitorColor::Profile),
@@ -321,6 +334,14 @@ mod tests {
         assert!(managed(0b0101));
         // forced off (bit 3) alone
         assert!(!managed(0b1000));
+    }
+
+    #[test]
+    fn an_unreadable_advanced_colour_state_is_unknown_rather_than_a_profile() {
+        assert_eq!(settled_by_windows(Some(true)), Some(MonitorColor::ManagedByWindows));
+        assert_eq!(settled_by_windows(Some(false)), None, "an SDR desktop: the monitor's profile decides");
+        // Windows may be converting already: a profile on top would convert twice
+        assert_eq!(settled_by_windows(None), Some(MonitorColor::Unknown));
     }
 
     #[test]

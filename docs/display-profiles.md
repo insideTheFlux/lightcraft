@@ -26,7 +26,8 @@ a restart. (GDI's `GetICMProfileW` keeps answering the profile a process first s
 monitor's device can't be found.) With no profile assigned, previews are sRGB. **While Windows colour-manages the
 desktop itself** (HDR on, or Auto Color Management on Windows 11: its advanced-colour state, from
 `DisplayConfigGetDeviceInfo`), it treats an ordinary app's output as sRGB and converts it for the monitor, so previews
-stay sRGB rather than be converted twice. The log says which applies (`screen profile: …`) whenever it changes.
+stay sRGB rather than be converted twice. So do they when that state can't be read (Windows 10 before 1709, a driver
+that doesn't report it). The log says which applies (`screen profile: …`) whenever it changes.
 
 ## Using it
 
