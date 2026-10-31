@@ -2,7 +2,7 @@ use super::options::{Conflict, DestinationMode, ExportFormat, HdrCurve, Metadata
 use super::place::clean_subfolder;
 use super::prepare::DngCompression;
 use super::watermark::{Anchor, Watermark};
-use super::*;
+use super::{ExportOptions, JxlColour, JxlEffort, JxlOptions, OutputDepth, OutputSpace, TiffCompression};
 
 impl Default for ExportOptions {
     fn default() -> Self {
