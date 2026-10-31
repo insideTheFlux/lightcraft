@@ -316,6 +316,8 @@ pub fn try_extract(bytes: &[u8]) -> Result<Metadata, ExtractError> {
 }
 
 fn extract_embedded(e: Embedded, mut m: Metadata, xmp: Option<XmpData>) -> Metadata {
+    // the size the Exif states: a size only the XMP states may be the upright one, so it can't tell how the photo is stored
+    let stored = m.width.zip(m.height);
     if let Some(i) = e.iptc.as_deref() {
         m.fill_missing(&parse_iptc(i));
     }
@@ -323,8 +325,8 @@ fn extract_embedded(e: Embedded, mut m: Metadata, xmp: Option<XmpData>) -> Metad
         m.overlay_user_fields(&xmp.metadata);
         m.fill_missing(&xmp.metadata);
         // boxes another app drew on the photo as stored go where the upright photo has them (#2674)
-        if let (Some(drawn_on), Some(orientation), Some(w), Some(h)) = (xmp.regions_drawn_on(), m.orientation, m.width, m.height) {
-            upright_regions(&mut m.regions, drawn_on, orientation, (w, h));
+        if let (Some(drawn_on), Some(orientation), Some(stored)) = (xmp.regions_drawn_on(), m.orientation, stored) {
+            upright_regions(&mut m.regions, drawn_on, orientation, stored);
         }
     }
     m
@@ -565,5 +567,37 @@ mod tests {
         // Lightroom's boxes say how the photo was turned: turned once, by that
         let lightroom = read(&regions_packet(6000, 4000, r#" mwg-rs:Rotation="-1.57080""#));
         assert!(near(lightroom, TURNED_6), "Lightroom's −π/2: {lightroom:?}");
+    }
+
+    /// A size only the XMP states can't tell how the photo is stored: `tiff:ImageWidth` and `tiff:ImageLength` of the
+    /// upright photo have the shape of boxes drawn on it upright, and those must not be turned.
+    #[test]
+    fn a_size_only_the_xmp_states_turns_no_regions() {
+        // orientation 6, no pixel size
+        let exif = write_exif(&Metadata { orientation: Some(Orientation::Rotate90), ..Default::default() });
+        let exif = strip_exif_header(&exif);
+        let packet = regions_packet(4000, 6000, "")
+            .replace(r#"rdf:about="""#, r#"rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:ImageWidth="4000" tiff:ImageLength="6000""#);
+        let mut j = vec![0xff, 0xd8];
+        let mut seg = |payload: Vec<u8>| {
+            j.extend([0xff, 0xe1]);
+            j.extend(u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+            j.extend(payload);
+        };
+        seg([b"Exif\0\0".as_slice(), exif].concat());
+        seg([b"http://ns.adobe.com/xap/1.0/\0".as_slice(), packet.as_bytes()].concat());
+        j.extend([0xff, 0xd9]);
+        let m = extract(&j);
+        assert_eq!((m.orientation, m.width, m.height), (Some(Orientation::Rotate90), Some(4000), Some(6000)));
+        assert_eq!(m.regions.len(), 1);
+        assert!(near(m.regions[0].rect, DRAWN), "{:?}", m.regions[0].rect);
+        assert_eq!(try_extract(&j).unwrap().regions, m.regions);
+        // a TIFF-based file: the whole file is the Exif block, with the XMP in its first IFD
+        let mut ifd0 = lightcraft_tiff::IfdBuilder::new();
+        ifd0.set(lightcraft_tiff::tags::ORIENTATION, lightcraft_tiff::Value::Short(vec![6]));
+        ifd0.set(lightcraft_tiff::tags::XMP, lightcraft_tiff::Value::Byte(packet.into_bytes()));
+        let m = extract(&lightcraft_tiff::TiffWriter::default().write(&[ifd0]).unwrap());
+        assert_eq!((m.orientation, m.width, m.height), (Some(Orientation::Rotate90), Some(4000), Some(6000)));
+        assert!(near(m.regions[0].rect, DRAWN), "TIFF: {:?}", m.regions[0].rect);
     }
 }

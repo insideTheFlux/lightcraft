@@ -553,6 +553,54 @@ fn regions_drawn_on_the_photo_as_stored_land_on_the_upright_photo() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// A raw LightCraft can't decode: a TIFF whose first IFD holds Exif orientation 6, a 40 × 30 JPEG and `packet`.
+fn turned_preview_only_raw(packet: &str) -> Vec<u8> {
+    let img = lightcraft_raster::Rgba8::from_fn(40, 30, |x, y| [(x * 6) as u8, (y * 8) as u8, 90, 255]);
+    let jpeg = lightcraft_codecs::encode_jpeg(&lightcraft_codecs::EncodeImage::rgba8(&img), 90, Default::default(), &Default::default()).unwrap();
+    let data = 8 + 2 + 4 * 12 + 4;
+    let (jpeg_len, packet_at) = (u32::try_from(jpeg.len()).unwrap(), u32::try_from(data + jpeg.len()).unwrap());
+    let mut f = b"II*\0\x08\0\0\0\x04\0".to_vec();
+    for (tag, kind, count, value) in [(274u16, 3u16, 1, 6), (513, 4, 1, data as u32), (514, 4, 1, jpeg_len), (700, 1, packet.len() as u32, packet_at)]
+    {
+        f.extend(tag.to_le_bytes());
+        f.extend(kind.to_le_bytes());
+        f.extend(u32::to_le_bytes(count));
+        f.extend(u32::to_le_bytes(value));
+    }
+    f.extend([0; 4]);
+    f.extend(jpeg);
+    f.extend(packet.as_bytes());
+    f
+}
+
+/// A sidecar with no `mwg-rs:Regions` leaves the boxes read from the file itself, and a raw's Exif may state no pixel
+/// size. A size only its XMP states, of the upright photo, has the shape of boxes drawn on it upright: they stay put.
+#[test]
+fn a_size_only_a_raws_xmp_states_leaves_upright_regions_as_written() {
+    let src = temp_dir("regions-xmp-size");
+    let file = src.join("p.iiq");
+    let upright_size = r#"rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:ImageWidth="24" tiff:ImageLength="32""#;
+    let packet =
+        STORED_FRAME_REGIONS.replace(r#"stDim:w="32" stDim:h="24""#, r#"stDim:w="24" stDim:h="32""#).replace(r#"rdf:about="""#, upright_size);
+    std::fs::write(&file, turned_preview_only_raw(&packet)).unwrap();
+    std::fs::write(
+        src.join("p.xmp"),
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+          <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/></rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let p = s.catalog.photo(only(&s)).unwrap();
+    assert!(p.preview_only.is_some() && (p.width, p.height) == (30, 40), "{:?} {}x{}", p.preview_only, p.width, p.height);
+    assert_eq!(p.rating, 2, "the sidecar was read");
+    assert_eq!(p.meta.regions.len(), 1);
+    let r = p.meta.regions[0].rect;
+    let got = [r.x0, r.y0, r.x1, r.y1];
+    assert!(got.iter().zip([0.2, 0.325, 0.3, 0.475]).all(|(g, w)| (g - w).abs() < 1e-9), "{got:?}");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 /// Removing a face box is a catalog-only, undoable edit: it never rewrites the sidecar (Lightroom's
 /// regions and everything else in it stay byte for byte), even with auto-write on.
 #[test]
